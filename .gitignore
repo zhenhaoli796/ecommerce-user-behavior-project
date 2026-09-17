@@ -3,3 +3,12 @@ __pycache__/
 *.pyc
 .idea/
 .ipynb_checkpoints/
+# real data files
+real_data_project/data/raw/*
+real_data_project/data/processed/*
+*.zip
+*.7z
+*.tar.gz
+
+!real_data_project/data/raw/.gitkeep
+!real_data_project/data/processed/.gitkeep
