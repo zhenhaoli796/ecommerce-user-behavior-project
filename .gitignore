@@ -12,3 +12,6 @@ real_data_project/data/processed/*
 
 !real_data_project/data/raw/.gitkeep
 !real_data_project/data/processed/.gitkeep
+
+identifier.sqlite
+*.sqlite
