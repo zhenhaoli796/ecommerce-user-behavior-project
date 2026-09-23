@@ -1,224 +1,166 @@
 from pathlib import Path
 
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    average_precision_score,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
 
-PROJECT_DIR = Path("D:/ecommerce-user-behavior-project/real_data_project")
-FEATURE_DATA_PATH = PROJECT_DIR / "data" / "processed" / "purchase_features_3d.csv"
-METRICS_OUTPUT_PATH = PROJECT_DIR / "data" / "processed" / "model_metrics_3d.csv"
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+INPUT_PATH = PROJECT_DIR / "data" / "sample" / "user_behavior_100k.csv"
+OUTPUT_PATH = PROJECT_DIR / "data" / "processed" / "purchase_features_3d.csv"
 
-TEST_START = pd.Timestamp("2017-11-29 00:00:00")
-VALIDATION_START = pd.Timestamp("2017-11-28 00:00:00")
-
-THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-
-COEFFICIENT_OUTPUT_PATH = (
-    PROJECT_DIR / "data" / "processed" / "logistic_feature_coefficients_3d.csv"
-)
-
-def load_feature_data():
-    feature_df = pd.read_csv(FEATURE_DATA_PATH)
-    feature_df["first_interest_time"] = pd.to_datetime(
-        feature_df["first_interest_time"]
-    )
-    return feature_df
+MODELING_START = pd.Timestamp("2017-11-25 00:00:00")
+MODELING_END = pd.Timestamp("2017-12-03 23:59:59")
+LABEL_WINDOW = pd.Timedelta(days=3)
+BEHAVIORS = ["pv", "fav", "cart", "buy"]
 
 
-def create_model():
-    return Pipeline(
-        steps=[
-            ("scaler", StandardScaler()),
-            (
-                "logistic_regression",
-                LogisticRegression(
-                    class_weight="balanced",
-                    max_iter=1000,
-                    random_state=42,
-                ),
-            ),
-        ]
+def load_data():
+    df = pd.read_csv(INPUT_PATH)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    return df.loc[
+        df["datetime"].between(MODELING_START, MODELING_END)
+    ].copy()
+
+
+def build_candidates(df):
+    interest = df.loc[
+        df["behavior_type"].isin(["pv", "fav", "cart"])
+    ].copy()
+
+    first_interest = (
+        interest.sort_values("datetime", kind="stable")
+        .drop_duplicates(["user_id", "item_id"], keep="first")
+        .rename(columns={
+            "datetime": "first_interest_time",
+            "behavior_type": "first_behavior_type",
+        })
+        [[
+            "user_id", "item_id", "category_id",
+            "first_interest_time", "first_behavior_type",
+        ]]
+        .reset_index(drop=True)
     )
 
+    print("\n===== first interest shape =====")
+    print(first_interest.shape)
 
-def evaluate_at_threshold(y_true, y_probability, threshold):
-    y_pred = (y_probability >= threshold).astype(int)
-
-    return {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "recall": recall_score(y_true, y_pred, zero_division=0),
-        "f1": f1_score(y_true, y_pred, zero_division=0),
-    }
+    # Only keep samples with a complete three-day observation window.
+    cutoff = MODELING_END - LABEL_WINDOW
+    candidates = first_interest.loc[
+        first_interest["first_interest_time"] <= cutoff
+    ].copy()
+    candidates.insert(0, "candidate_id", candidates.index)
+    return candidates.reset_index(drop=True)
 
 
-feature_df = load_feature_data()
+def attach_labels(candidates, df):
+    buys = df.loc[
+        df["behavior_type"].eq("buy"),
+        ["user_id", "item_id", "datetime"],
+    ].rename(columns={"datetime": "buy_time"})
 
-metadata_columns = [
-    "candidate_id",
-    "user_id",
-    "item_id",
-    "category_id",
-    "first_interest_time",
-    "label",
-]
-
-feature_columns = [
-    column
-    for column in feature_df.columns
-    if column not in metadata_columns
-]
-
-train_df = feature_df[
-    feature_df["first_interest_time"] < TEST_START
-].copy()
-
-test_df = feature_df[
-    feature_df["first_interest_time"] >= TEST_START
-].copy()
-
-model_train_df = train_df[
-    train_df["first_interest_time"] < VALIDATION_START
-].copy()
-
-validation_df = train_df[
-    train_df["first_interest_time"] >= VALIDATION_START
-].copy()
-
-print("===== feature count =====")
-print(len(feature_columns))
-
-print("\n===== model train shape and purchase rate =====")
-print(model_train_df.shape)
-print(model_train_df["label"].mean().round(4))
-
-print("\n===== validation shape and purchase rate =====")
-print(validation_df.shape)
-print(validation_df["label"].mean().round(4))
-
-print("\n===== test shape and purchase rate =====")
-print(test_df.shape)
-print(test_df["label"].mean().round(4))
-
-X_model_train = model_train_df[feature_columns]
-y_model_train = model_train_df["label"]
-
-X_validation = validation_df[feature_columns]
-y_validation = validation_df["label"]
-
-validation_model = create_model()
-validation_model.fit(X_model_train, y_model_train)
-
-validation_probability = validation_model.predict_proba(X_validation)[:, 1]
-
-threshold_results = []
-
-for threshold in THRESHOLDS:
-    threshold_metric = evaluate_at_threshold(
-        y_validation,
-        validation_probability,
-        threshold,
+    matched = candidates.merge(
+        buys, on=["user_id", "item_id"], how="left"
     )
-    threshold_metric["threshold"] = threshold
-    threshold_results.append(threshold_metric)
+    within_window = (
+        (matched["buy_time"] > matched["first_interest_time"])
+        & (
+            matched["buy_time"]
+            <= matched["first_interest_time"] + LABEL_WINDOW
+        )
+    )
+    positive_ids = matched.loc[within_window, "candidate_id"].unique()
 
-threshold_results = pd.DataFrame(threshold_results)
-
-best_threshold_row = threshold_results.loc[
-    threshold_results["f1"].idxmax()
-]
-
-best_threshold = best_threshold_row["threshold"]
-
-print("\n===== validation threshold results =====")
-print(
-    threshold_results[
-        ["threshold", "precision", "recall", "f1"]
-    ].round(4)
-)
-
-print("\n===== selected threshold by validation F1 =====")
-print(best_threshold)
-
-X_train = train_df[feature_columns]
-y_train = train_df["label"]
-
-X_test = test_df[feature_columns]
-y_test = test_df["label"]
-
-final_model = create_model()
-final_model.fit(X_train, y_train)
-
-test_probability = final_model.predict_proba(X_test)[:, 1]
-
-test_metrics = evaluate_at_threshold(
-    y_test,
-    test_probability,
-    best_threshold,
-)
-
-test_metrics["roc_auc"] = roc_auc_score(y_test, test_probability)
-test_metrics["pr_auc"] = average_precision_score(y_test, test_probability)
-test_metrics["selected_threshold"] = best_threshold
-
-test_pred = (test_probability >= best_threshold).astype(int)
-
-print("\n===== final test metrics =====")
-print(pd.Series(test_metrics).round(4))
-
-print("\n===== final test confusion matrix =====")
-print(confusion_matrix(y_test, test_pred))
-
-pd.DataFrame([test_metrics]).to_csv(
-    METRICS_OUTPUT_PATH,
-    index=False,
-)
-
-print("\n===== metrics saved path =====")
-print(METRICS_OUTPUT_PATH)
-
-coefficients = pd.DataFrame(
-    {
-        "feature": feature_columns,
-        "coefficient": final_model.named_steps[
-            "logistic_regression"
-        ].coef_[0],
-    }
-)
-
-coefficients["abs_coefficient"] = coefficients[
-    "coefficient"
-].abs()
-
-coefficients = coefficients.sort_values(
-    "coefficient",
-    ascending=False,
-)
-
-coefficients.to_csv(
-    COEFFICIENT_OUTPUT_PATH,
-    index=False,
-)
-
-print("\n===== top positive features =====")
-print(coefficients.head(10)[["feature", "coefficient"]])
-
-print("\n===== top negative features =====")
-print(coefficients.tail(10)[["feature", "coefficient"]])
-
-print("\n===== coefficients saved path =====")
-print(COEFFICIENT_OUTPUT_PATH)
+    samples = candidates.copy()
+    samples["label"] = samples["candidate_id"].isin(positive_ids).astype(int)
+    return samples
 
 
+def build_basic_features(samples):
+    features = samples.copy()
+    features["hour"] = features["first_interest_time"].dt.hour
+    features["weekday"] = features["first_interest_time"].dt.dayofweek
+    features["is_weekend"] = (features["weekday"] >= 5).astype(int)
 
+    features["first_behavior_type"] = pd.Categorical(
+        features["first_behavior_type"],
+        categories=["cart", "fav", "pv"],
+    )
+    return pd.get_dummies(
+        features, columns=["first_behavior_type"], dtype=int
+    )
+
+
+def add_history_features(features, df, entity):
+    entity_id = f"{entity}_id"
+    history = features[
+        ["candidate_id", entity_id, "first_interest_time"]
+    ].merge(
+        df[[entity_id, "behavior_type", "datetime"]],
+        on=entity_id,
+        how="left",
+    )
+
+    # Exclude the current event and every event after prediction time.
+    history = history.loc[
+        history["datetime"] < history["first_interest_time"]
+    ]
+
+    counts = (
+        history.groupby(["candidate_id", "behavior_type"])
+        .size()
+        .unstack(fill_value=0)
+        .reindex(columns=BEHAVIORS, fill_value=0)
+    )
+    count_columns = [
+        f"{entity}_history_{behavior}_count"
+        for behavior in BEHAVIORS
+    ]
+    counts.columns = count_columns
+
+    features = features.merge(
+        counts, left_on="candidate_id", right_index=True, how="left"
+    )
+    features[count_columns] = features[count_columns].fillna(0).astype(int)
+    features[f"{entity}_history_behavior_count"] = (
+        features[count_columns].sum(axis=1)
+    )
+
+    if entity == "user":
+        features["user_has_bought_before"] = (
+            features["user_history_buy_count"] > 0
+        ).astype(int)
+
+    return features
+
+
+def main():
+    df = load_data()
+    candidates = build_candidates(df)
+    samples = attach_labels(candidates, df)
+
+    print("\n===== label distribution =====")
+    print(samples["label"].value_counts())
+    print("\n===== 3-day purchase rate =====")
+    print(samples["label"].mean())
+
+    features = build_basic_features(samples)
+    for entity in ["user", "item", "category"]:
+        features = add_history_features(features, df, entity)
+        print(f"\n===== {entity} history features completed =====")
+
+    assert features["candidate_id"].is_unique
+    assert not features.isna().any().any()
+
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    features.to_csv(OUTPUT_PATH, index=False)
+
+    print("\n===== model dataset shape =====")
+    print(features.shape)
+    print("\n===== missing values =====")
+    print(features.isna().sum().sum())
+    print("\n===== saved path =====")
+    print(OUTPUT_PATH)
+
+
+if __name__ == "__main__":
+    main()
